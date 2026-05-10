@@ -1,0 +1,17 @@
+example.txt
+output.mp4
+video-clipper.code-workspace
+capture.ps1
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+
+# Media
+*.mkv
+*.mov
+*.avi
+*.mp3
+*.wav
