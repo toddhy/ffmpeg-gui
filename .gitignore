@@ -16,3 +16,7 @@ capture.ps1
 *.mp3
 *.wav
 *.mp4
+
+__pycache__/
+
+*.pyc

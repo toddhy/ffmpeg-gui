@@ -7,8 +7,12 @@ import re
 import json
 
 class VideoClipperGUI:
+    DEFAULT_OUTPUT_NAME = "output.mp4"
+
     def __init__(self, root):
         self.root = root
+        self.previous_output_path = None
+        self.previous_output_input_path = None
         self.root.title("Video Clipper Pro")
         self.root.geometry("750x800")
         self.root.configure(bg="#1e1e1e")
@@ -65,11 +69,15 @@ class VideoClipperGUI:
         
         # Output Filename
         ttk.Label(self.main_frame, text="Output Name:").grid(row=5, column=0, sticky="w", pady=5)
-        self.output_name_var = tk.StringVar(value="output.mp4")
+        self.output_name_var = tk.StringVar(value=self.DEFAULT_OUTPUT_NAME)
         self.output_entry = ttk.Entry(self.main_frame, textvariable=self.output_name_var)
         self.output_entry.grid(row=5, column=1, padx=5, pady=5, sticky="ew")
-        self.output_browse_btn = ttk.Button(self.main_frame, text="Save As…", command=self.browse_output)
-        self.output_browse_btn.grid(row=5, column=2, padx=5, pady=5)
+        output_buttons = ttk.Frame(self.main_frame)
+        output_buttons.grid(row=5, column=2, padx=5, pady=5, sticky="e")
+        self.output_reset_btn = ttk.Button(output_buttons, text="Default", command=self.reset_output)
+        self.output_reset_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.output_browse_btn = ttk.Button(output_buttons, text="Save As…", command=self.browse_output)
+        self.output_browse_btn.pack(side=tk.LEFT)
 
         # Audio Options
         opts_frame = tk.Frame(self.main_frame, bg="#252525", bd=0, highlightthickness=1,
@@ -115,10 +123,10 @@ class VideoClipperGUI:
         )
         self.play_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.rename_btn = tk.Button(
-            action_frame, text="✏  Rename…",
+            action_frame, text="✏  Rename Previous Output…",
             bg="#2e2a1a", fg="#ffd966", activebackground="#4a421a", activeforeground="#ffd966",
             font=("Segoe UI", 10, "bold"), relief="flat", bd=0, padx=14, pady=6,
-            cursor="hand2", command=self.rename_output
+            cursor="hand2", command=self.rename_previous_output
         )
         self.rename_btn.pack(side=tk.LEFT)
         
@@ -147,26 +155,28 @@ class VideoClipperGUI:
         self.lufs_entry.config(state=state)
 
     def _build_time_buttons(self, parent, time_var, row):
-        """Create a compact row of +/- nudge buttons for a timestamp field."""
+        """Create paired positive-over-negative nudge buttons for a timestamp field."""
         btn_frame = tk.Frame(parent, bg="#1e1e1e")
         btn_frame.grid(row=row, column=2, padx=(0, 5), pady=5, sticky="w")
 
-        steps = [("−5m", -300), ("−1m", -60), ("−30s", -30), ("−5s", -5), ("−1s", -1),
-                 ("+1s",  1),  ("+5s",   5), ("+30s",  30), ("+1m",  60), ("+5m", 300)]
-
-        for label, delta in steps:
-            is_positive = delta > 0
-            bg  = "#1a4a2e" if is_positive else "#4a1a1a"
-            abg = "#27723f" if is_positive else "#72271a"
-            fg  = "#4dff91" if is_positive else "#ff6b6b"
-            btn = tk.Button(
-                btn_frame, text=label,
-                bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
-                font=("Segoe UI", 8, "bold"),
-                relief="flat", bd=0, padx=4, pady=2, cursor="hand2",
-                command=lambda v=time_var, d=delta: self._nudge_time(v, d)
-            )
-            btn.pack(side=tk.LEFT, padx=1)
+        step_seconds = [300, 60, 30, 5, 1]
+        for column, seconds in enumerate(step_seconds):
+            for button_row, delta in enumerate((seconds, -seconds)):
+                is_positive = delta > 0
+                bg  = "#1a4a2e" if is_positive else "#4a1a1a"
+                abg = "#27723f" if is_positive else "#72271a"
+                fg  = "#4dff91" if is_positive else "#ff6b6b"
+                unit = "m" if seconds >= 60 else "s"
+                amount = seconds // 60 if seconds >= 60 else seconds
+                sign = "+" if is_positive else "−"
+                btn = tk.Button(
+                    btn_frame, text=f"{sign}{amount}{unit}",
+                    bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
+                    font=("Segoe UI", 8, "bold"),
+                    relief="flat", bd=0, padx=4, pady=2, cursor="hand2",
+                    command=lambda v=time_var, d=delta: self._nudge_time(v, d)
+                )
+                btn.grid(row=button_row, column=column, padx=1, pady=1)
 
     @staticmethod
     def _time_to_seconds(t):
@@ -210,7 +220,13 @@ class VideoClipperGUI:
 
     def browse_file(self):
         file_path = filedialog.askopenfilename(title="Select Video", filetypes=[("Video", "*.mp4 *.mkv *.avi *.mov"), ("All", "*.*")])
-        if file_path: self.input_path_var.set(file_path)
+        if file_path:
+            self.input_path_var.set(file_path)
+            self.reset_output()
+
+    def reset_output(self):
+        """Return the output name to the standard filename."""
+        self.output_name_var.set(self.DEFAULT_OUTPUT_NAME)
 
     def browse_output(self):
         """Let the user pick a save location and filename for the output."""
@@ -237,11 +253,11 @@ class VideoClipperGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Could not open file:\n{e}")
 
-    def rename_output(self):
-        """Rename the output file on disk via an inline dialog."""
-        old_path = self.output_name_var.get()
+    def rename_previous_output(self):
+        """Rename the most recently produced output file via an inline dialog."""
+        old_path = self.previous_output_path
         if not old_path or not os.path.exists(old_path):
-            messagebox.showwarning("Rename", "Output file not found. Clip a video first.")
+            messagebox.showwarning("Rename", "Previous output file not found. Clip a video first.")
             return
 
         dialog = tk.Toplevel(self.root)
@@ -269,7 +285,9 @@ class VideoClipperGUI:
             new_path = os.path.join(old_dir, new_name)
             try:
                 os.rename(old_path, new_path)
-                self.output_name_var.set(new_path)
+                self.previous_output_path = new_path
+                if self.output_name_var.get() == old_path:
+                    self.output_name_var.set(new_path)
                 self.log(f">>> Renamed to: {new_path}")
                 dialog.destroy()
             except OSError as e:
@@ -294,6 +312,10 @@ class VideoClipperGUI:
         pattern = r"^(?:(?:(\d{1,2}):)?(\d{1,2}):)?(\d{1,2})$"
         return re.match(pattern, time_str) is not None
 
+    @staticmethod
+    def paths_match(first_path, second_path):
+        return os.path.normcase(os.path.abspath(first_path)) == os.path.normcase(os.path.abspath(second_path))
+
     def log(self, message):
         self.log_area.insert(tk.END, message + "\n")
         self.log_area.see(tk.END)
@@ -310,15 +332,20 @@ class VideoClipperGUI:
             messagebox.showerror("Error", "Invalid time format. Please use HH:MM:SS.")
             return
 
-        # Check if output file is writable
+        input_path = self.input_path_var.get()
         output = self.output_name_var.get()
         if os.path.exists(output):
-            try:
-                with open(output, 'ab'):
-                    pass
-            except IOError:
-                messagebox.showerror("Permission Denied", 
-                    f"Cannot write to '{output}'.\n\nIs the file open in a video player? Please close it and try again.")
+            can_overwrite = (
+                self.previous_output_path
+                and self.previous_output_input_path
+                and self.paths_match(output, self.previous_output_path)
+                and self.paths_match(input_path, self.previous_output_input_path)
+            )
+            if not can_overwrite:
+                messagebox.showwarning(
+                    "Output Already Exists",
+                    f"'{output}' already exists.\n\nChoose a different output name before clipping from this input video."
+                )
                 return
 
         self.run_btn.config(state=tk.DISABLED)
@@ -334,8 +361,14 @@ class VideoClipperGUI:
         end = self.end_time_var.get()
         output = self.output_name_var.get()
         ffmpeg_cmd = self.ffmpeg_path_var.get()
+        can_overwrite = (
+            self.previous_output_path
+            and self.previous_output_input_path
+            and self.paths_match(output, self.previous_output_path)
+            and self.paths_match(input_path, self.previous_output_input_path)
+        )
         
-        cmd = [ffmpeg_cmd, "-y", "-i", input_path, "-ss", start, "-to", end,
+        cmd = [ffmpeg_cmd, "-y" if can_overwrite else "-n", "-i", input_path, "-ss", start, "-to", end,
                "-c:v", "libx264", "-crf", "18", "-preset", "medium",
                "-c:a", "aac", "-b:a", "128k"]
 
@@ -405,6 +438,8 @@ class VideoClipperGUI:
                     self.root.after(0, self.log, line.strip())
             
             if process.returncode == 0:
+                self.previous_output_path = output
+                self.previous_output_input_path = input_path
                 self.root.after(0, lambda: self.status_var.set("SUCCESS!"))
                 self.root.after(0, lambda: messagebox.showinfo("Success", f"Video clipped successfully!\nSaved as: {output}"))
             else:
