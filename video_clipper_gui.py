@@ -368,6 +368,11 @@ class VideoClipperGUI:
             and self.paths_match(input_path, self.previous_output_input_path)
         )
         
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
         cmd = [ffmpeg_cmd, "-y" if can_overwrite else "-n", "-i", input_path, "-ss", start, "-to", end,
                "-c:v", "libx264", "-crf", "18", "-preset", "medium",
                "-c:a", "aac", "-b:a", "128k"]
@@ -422,11 +427,6 @@ class VideoClipperGUI:
         cmd.append(output)
         
         try:
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
             process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, 
                                      text=True, startupinfo=startupinfo)
             
