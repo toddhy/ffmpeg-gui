@@ -7,6 +7,7 @@ import re
 import json
 import math
 import shutil
+import time
 
 class VideoClipperGUI:
     DEFAULT_OUTPUT_NAME = "output.mp4"
@@ -16,6 +17,19 @@ class VideoClipperGUI:
         self.previous_output_path = None
         self.previous_output_input_path = None
         self.preview_process = None
+        self.preview_stop_event = threading.Event()
+        self.preview_image = None
+        self.preview_position = 0.0
+        self.preview_source = None
+        self.preview_duration = 0.0
+        self.preview_started_at = 0.0
+        self.preview_window_title = ""
+        self.preview_window_handle = None
+        self.preview_paused = False
+        self.preview_slider_dragging = False
+        self.preview_space_down = False
+        self.preview_wndproc_callback = None
+        self.preview_original_wndproc = None
         self.current_process = None
         self.cancel_requested = False
         self.output_customized = False
@@ -25,8 +39,8 @@ class VideoClipperGUI:
         self.is_processing = False
 
         self.root.title("Video Clipper Pro")
-        self.root.geometry("820x920")
-        self.root.minsize(780, 800)
+        self.root.geometry("820x1180")
+        self.root.minsize(780, 1000)
         self.root.configure(bg="#1e1e1e")
 
         # Discover ffmpeg, ffplay, and ffprobe
@@ -61,6 +75,9 @@ class VideoClipperGUI:
         self.main_frame.pack(fill=tk.BOTH, expand=True)
 
         self._build_ui()
+        self.root.bind_all("<KeyPress-space>", self._on_spacebar)
+        self.root.bind_class("Button", "<KeyPress-space>", self._on_spacebar)
+        self.root.bind_class("TButton", "<KeyPress-space>", self._on_spacebar)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def find_binary(self, name):
@@ -83,7 +100,7 @@ class VideoClipperGUI:
         header_frame.grid(row=grid_row, column=0, columnspan=3, pady=(0, 8), sticky="w")
         tk.Label(header_frame, text="Video Clipper Pro", font=("Segoe UI", 18, "bold"),
                  bg="#1e1e1e", fg="#007acc").pack(side=tk.LEFT)
-        tk.Label(header_frame, text="  Fast Seek • Precision Clips • Batch Queue • Preview",
+        tk.Label(header_frame, text="  Fast Seek • Precision Clips • Preview",
                  font=("Segoe UI", 9), bg="#1e1e1e", fg="#666666").pack(side=tk.LEFT, padx=(5, 0), pady=(6, 0))
         grid_row += 1
 
@@ -147,18 +164,80 @@ class VideoClipperGUI:
                       font=("Segoe UI", 8, "bold"), relief="flat", bd=0, padx=6, pady=1, cursor="hand2",
                       command=lambda sec=s: self._extend_end_time(sec)).pack(side=tk.LEFT, padx=2)
 
-        # Preview buttons using ffplay
+        # Preview buttons using embedded ffplay
         self.stop_prev_btn = tk.Button(duration_bar, text="⏹ Stop", bg="#4a1a1a", fg="#ff6b6b",
                                        activebackground="#602525", font=("Segoe UI", 8, "bold"),
                                        relief="flat", bd=0, padx=8, pady=2, cursor="hand2",
                                        command=self.stop_preview)
         self.stop_prev_btn.pack(side=tk.RIGHT, padx=(2, 10))
 
-        self.preview_btn = tk.Button(duration_bar, text="▶ Preview Clip (ffplay)", bg="#2e1a47", fg="#c084fc",
+        self.preview_clip_btn = tk.Button(duration_bar, text="▶ Preview Clip", bg="#2e1a47", fg="#c084fc",
                                      activebackground="#45276d", font=("Segoe UI", 8, "bold"),
                                      relief="flat", bd=0, padx=10, pady=2, cursor="hand2",
                                      command=self.preview_clip)
-        self.preview_btn.pack(side=tk.RIGHT, padx=2)
+        self.preview_clip_btn.pack(side=tk.RIGHT, padx=2)
+
+        self.preview_video_btn = tk.Button(duration_bar, text="▶ Preview Video", bg="#1a3a4a", fg="#4dcfff",
+                                           activebackground="#254a60", font=("Segoe UI", 8, "bold"),
+                                           relief="flat", bd=0, padx=10, pady=2, cursor="hand2",
+                                           command=self.preview_video)
+        self.preview_video_btn.pack(side=tk.RIGHT, padx=2)
+        grid_row += 1
+
+        # Embedded playback surface for the full input video.
+        self.preview_surface = tk.Frame(self.main_frame, bg="#000000", width=760, height=400,
+                                        highlightthickness=1, highlightbackground="#333333")
+        self.preview_surface.grid(row=grid_row, column=0, columnspan=3, sticky="ew", pady=(0, 6), padx=1)
+        self.preview_surface.grid_propagate(False)
+        self.preview_image_label = tk.Label(self.preview_surface, bg="#000000")
+        self.preview_image_label.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.preview_placeholder = tk.Label(
+            self.preview_surface, text="Select a video, then click Preview Video",
+            bg="#000000", fg="#777777", font=("Segoe UI", 11)
+        )
+        self.preview_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        grid_row += 1
+
+        self.preview_time_var = tk.StringVar(value="00:00:00 / 00:00:00")
+        tk.Label(self.main_frame, textvariable=self.preview_time_var, bg="#1e1e1e",
+                 fg="#888888", font=("Segoe UI", 8)).grid(
+                     row=grid_row, column=0, columnspan=3, sticky="e", padx=6, pady=(0, 2)
+                 )
+        grid_row += 1
+
+        self.preview_controls = tk.Frame(self.main_frame, bg="#1e1e1e")
+        self.preview_controls.grid(row=grid_row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        self.preview_seek_scale = tk.Scale(
+            self.preview_controls, from_=0, to=100, orient=tk.HORIZONTAL,
+            showvalue=False, resolution=0.1, length=260, highlightthickness=0,
+            bg="#1e1e1e", fg="#4dcfff", troughcolor="#333333",
+            activebackground="#4dcfff", sliderrelief="flat", bd=0,
+            command=self._preview_slider_changed
+        )
+        self.preview_seek_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
+        self.preview_seek_scale.bind("<ButtonPress-1>", self._start_preview_slider_drag, add="+")
+        self.preview_seek_scale.bind("<ButtonRelease-1>", self._seek_preview_slider, add="+")
+        for text, delta in (("⏮ -10s", -10), ("◀ -1s", -1), ("+1s ▶", 1), ("+10s ⏭", 10)):
+            tk.Button(self.preview_controls, text=text, bg="#252525", fg="#aaaaaa",
+                      activebackground="#3a3a3a", activeforeground="#ffffff",
+                      font=("Segoe UI", 8, "bold"), relief="flat", bd=0,
+                      padx=8, pady=3, cursor="hand2",
+                      command=lambda amount=delta: self._seek_preview(amount)).pack(side=tk.LEFT, padx=2)
+        self.preview_play_btn = tk.Button(self.preview_controls, text="▶ Play",
+                                          bg="#1a3a4a", fg="#4dcfff", activebackground="#254a60",
+                                          font=("Segoe UI", 8, "bold"), relief="flat", bd=0,
+                                          padx=8, pady=3, cursor="hand2", command=self._toggle_preview_pause)
+        self.preview_play_btn.pack(side=tk.LEFT, padx=(8, 2))
+        tk.Button(self.preview_controls, text="Set Start Here", bg="#1a4a2e", fg="#4dff91",
+              activebackground="#27723f", activeforeground="#ffffff",
+              font=("Segoe UI", 8, "bold"), relief="flat", bd=0,
+              padx=7, pady=3, cursor="hand2",
+              command=self._set_start_to_preview).pack(side=tk.LEFT, padx=(8, 2))
+        tk.Button(self.preview_controls, text="Set End Here", bg="#4a2e1a", fg="#ffd966",
+              activebackground="#724a27", activeforeground="#ffffff",
+              font=("Segoe UI", 8, "bold"), relief="flat", bd=0,
+              padx=7, pady=3, cursor="hand2",
+              command=self._set_end_to_preview).pack(side=tk.LEFT, padx=2)
         grid_row += 1
 
         # --- Output Filename & Directory ---
@@ -241,7 +320,7 @@ class VideoClipperGUI:
         hw_chk.pack(side=tk.RIGHT, padx=(0, 10))
         grid_row += 1
 
-        # --- Primary Action Bar: Start Clipping + Add to Queue + Cancel ---
+        # --- Primary Action Bar: Start Clipping + Cancel ---
         actions_bar = tk.Frame(self.main_frame, bg="#1e1e1e")
         actions_bar.grid(row=grid_row, column=0, columnspan=3, sticky="ew", pady=(6, 6))
 
@@ -249,62 +328,11 @@ class VideoClipperGUI:
                                   command=self.start_single_clip)
         self.run_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, ipady=8, padx=(0, 6))
 
-        self.add_queue_btn = ttk.Button(actions_bar, text="➕ Add to Batch Queue", style="Queue.TButton",
-                                        command=self.add_to_queue)
-        self.add_queue_btn.pack(side=tk.LEFT, fill=tk.BOTH, ipady=8, padx=(0, 6))
-
         self.cancel_btn = tk.Button(actions_bar, text="⏹ Cancel", bg="#4a1a1a", fg="#ff6b6b",
                                     activebackground="#6b2323", activeforeground="#ffffff",
                                     font=("Segoe UI", 10, "bold"), relief="flat", bd=0, padx=14, pady=6,
                                     cursor="hand2", state="disabled", command=self.cancel_processing)
         self.cancel_btn.pack(side=tk.RIGHT, fill=tk.BOTH, ipady=4)
-        grid_row += 1
-
-        # --- Batch Queue View (Compact Treeview) ---
-        queue_box = tk.LabelFrame(self.main_frame, text=" Batch Queue ", bg="#1e1e1e", fg="#60a5fa",
-                                  font=("Segoe UI", 9, "bold"), bd=1, relief="solid")
-        queue_box.grid(row=grid_row, column=0, columnspan=3, sticky="ew", pady=(2, 6))
-
-        q_cols = ("num", "file", "range", "dur", "fmt", "status")
-        self.queue_tree = ttk.Treeview(queue_box, columns=q_cols, show="headings", height=3, selectmode="browse")
-        self.queue_tree.heading("num", text="#")
-        self.queue_tree.heading("file", text="Video")
-        self.queue_tree.heading("range", text="Range")
-        self.queue_tree.heading("dur", text="Duration")
-        self.queue_tree.heading("fmt", text="Fmt")
-        self.queue_tree.heading("status", text="Status")
-
-        self.queue_tree.column("num", width=30, anchor="center")
-        self.queue_tree.column("file", width=220, anchor="w")
-        self.queue_tree.column("range", width=180, anchor="center")
-        self.queue_tree.column("dur", width=80, anchor="center")
-        self.queue_tree.column("fmt", width=50, anchor="center")
-        self.queue_tree.column("status", width=100, anchor="center")
-        self.queue_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
-        self.queue_tree.bind("<Double-1>", self._on_queue_double_click)
-
-        q_scroll = ttk.Scrollbar(queue_box, orient="vertical", command=self.queue_tree.yview)
-        self.queue_tree.configure(yscrollcommand=q_scroll.set)
-        q_scroll.pack(side=tk.LEFT, fill=tk.Y, pady=4)
-
-        q_btn_frame = tk.Frame(queue_box, bg="#1e1e1e")
-        q_btn_frame.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=4)
-
-        self.process_queue_btn = tk.Button(q_btn_frame, text="⚡ Process Queue", bg="#1a3a4a", fg="#4dcfff",
-                                           activebackground="#254a60", font=("Segoe UI", 9, "bold"),
-                                           relief="flat", bd=0, padx=8, pady=4, cursor="hand2",
-                                           command=self.start_batch_queue)
-        self.process_queue_btn.pack(fill=tk.X, pady=(0, 3))
-
-        self.remove_queue_btn = tk.Button(q_btn_frame, text="❌ Remove", bg="#333333", fg="#ff6b6b", activebackground="#444444",
-                          font=("Segoe UI", 8), relief="flat", bd=0, padx=6, pady=2, cursor="hand2",
-                          command=self.remove_from_queue)
-        self.remove_queue_btn.pack(fill=tk.X, pady=1)
-
-        self.clear_queue_btn = tk.Button(q_btn_frame, text="🗑 Clear", bg="#252525", fg="#888888", activebackground="#333333",
-                         font=("Segoe UI", 8), relief="flat", bd=0, padx=6, pady=2, cursor="hand2",
-                         command=self.clear_queue)
-        self.clear_queue_btn.pack(fill=tk.X, pady=1)
         grid_row += 1
 
         # --- Progress Bar & Progress Label ---
@@ -577,8 +605,16 @@ class VideoClipperGUI:
         self.auto_generate_output_path()
 
     # ------------------------------------------------------------------
-    # In-App Preview (ffplay)
+    # In-App Preview (ffplay re-parented into Tk)
     # ------------------------------------------------------------------
+
+    def preview_video(self):
+        input_path = self.input_path_var.get().strip()
+        if not input_path or not os.path.exists(input_path):
+            messagebox.showwarning("Preview", "Please select a valid input video.")
+            return
+
+        self._start_preview(input_path, 0.0, None, "full video")
 
     def preview_clip(self):
         input_path = self.input_path_var.get().strip()
@@ -591,32 +627,308 @@ class VideoClipperGUI:
         if e <= s:
             messagebox.showwarning("Preview", "End time must be greater than Start time.")
             return
-        dur = e - s
+        self._start_preview(input_path, s, e - s, "clip")
 
-        self.stop_preview()
+    def _start_preview(self, input_path, start_seconds, duration, description, start_paused=False):
+        self._stop_preview_process(show_placeholder=False)
+        self.preview_surface.update_idletasks()
 
-        start_str = self._seconds_to_time(s, force_subseconds=True)
-        cmd = [
-            self.ffplay_path,
-            "-ss", start_str,
-            "-t", str(dur),
-            "-autoexit",
-            "-window_title", f"Preview: {os.path.basename(input_path)} [{self.start_time_var.get()} - {self.end_time_var.get()}]",
-            input_path
-        ]
+        start_seconds = max(0.0, float(start_seconds))
+        if self.video_duration > 0:
+            start_seconds = min(start_seconds, max(0.0, self.video_duration - 0.01))
+        self.preview_stop_event.clear()
+        self.preview_position = start_seconds
+        self.preview_paused = start_paused
+        self.preview_space_down = False
+        self.preview_window_handle = None
+        self.preview_source = input_path
+        self.preview_duration = duration or self.video_duration or self._time_to_seconds(self.end_time_var.get())
+        self.preview_time_var.set(
+            f"{self._seconds_to_time(start_seconds)} / {self._seconds_to_time(self.preview_duration)}"
+        )
+        self.preview_play_btn.config(text="▶ Resume" if start_paused else "⏸ Pause")
+
+        self.preview_window_title = f"Video Clipper Preview {os.getpid()}"
+        cmd = [self.ffplay_path, "-ss",
+               self._seconds_to_time(start_seconds, force_subseconds=True),
+             "-window_title", self.preview_window_title, "-noborder",
+             "-left", "-10000", "-top", "-10000"]
+        if duration is not None:
+            cmd += ["-t", str(duration), "-autoexit"]
+        cmd.append(input_path)
         try:
-            self.preview_process = subprocess.Popen(cmd)
-            self.status_var.set(f"Previewing [{start_str} + {dur:.1f}s] in ffplay...")
+            self.preview_placeholder.place_forget()
+            startupinfo = None
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            self.preview_process = subprocess.Popen(
+                cmd, startupinfo=startupinfo
+            )
+            self.preview_started_at = time.monotonic()
+            threading.Thread(target=self._embed_ffplay_window,
+                             args=(self.preview_process,), daemon=True).start()
+            self.root.after(100, self._update_preview_clock)
+            self.status_var.set(f"Previewing {description} with audio in the clipper window...")
         except Exception as ex:
-            messagebox.showerror("Preview Error", f"Could not launch ffplay:\n{ex}")
+            self.preview_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+            messagebox.showerror("Preview Error", f"Could not start FFmpeg preview:\n{ex}")
 
-    def stop_preview(self):
+    def _embed_ffplay_window(self, process):
+        if os.name != "nt":
+            self.root.after(0, self._preview_embed_failed)
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = ctypes.c_size_t
+        window_handle = None
+        for _ in range(60):
+            if self.preview_stop_event.is_set() or process.poll() is not None:
+                return
+            window_handle = user32.FindWindowW(None, self.preview_window_title)
+            if window_handle:
+                break
+            time.sleep(0.05)
+        if not window_handle or self.preview_stop_event.is_set():
+            if not self.preview_stop_event.is_set():
+                self.root.after(0, self._preview_embed_failed)
+            return
+        self.root.after(0, self._attach_ffplay_window, window_handle)
+
+    def _preview_embed_failed(self):
+        if self.preview_process and self.preview_process.poll() is None:
+            self.preview_process.terminate()
+        self.preview_process = None
+        self.preview_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        messagebox.showerror("Preview Error", "Could not embed the audio/video player in the clipper window.")
+
+    def _attach_ffplay_window(self, window_handle):
+        if not self.preview_process or self.preview_stop_event.is_set():
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.SetParent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.SetParent.restype = ctypes.c_void_p
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.InvalidateRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+        user32.UpdateWindow.argtypes = [ctypes.c_void_p]
+        self.preview_window_handle = window_handle
+        parent_handle = self.preview_surface.winfo_id()
+        user32.SetParent(ctypes.c_void_p(window_handle), ctypes.c_void_p(parent_handle))
+        get_style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        set_style = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        get_style.restype = ctypes.c_ssize_t
+        set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+        set_style.restype = ctypes.c_ssize_t
+        style = get_style(window_handle, -16)
+        style = (style & ~0x00CF0000) | 0x40000000
+        set_style(ctypes.c_void_p(window_handle), -16, style)
+        self._install_preview_key_handler(window_handle)
+        self._resize_embedded_preview(window_handle)
+        user32.ShowWindow(ctypes.c_void_p(window_handle), 5)
+        user32.InvalidateRect(ctypes.c_void_p(window_handle), None, True)
+        user32.UpdateWindow(ctypes.c_void_p(window_handle))
+        if self.preview_paused:
+            self.root.after(100, self._pause_embedded_preview)
+
+    def _pause_embedded_preview(self):
+        if self.preview_process and self.preview_window_handle and self.preview_paused:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            user32.PostMessageW(self.preview_window_handle, 0x0100, ord("P"), 0)
+            user32.PostMessageW(self.preview_window_handle, 0x0101, ord("P"), 0)
+
+    def _install_preview_key_handler(self, window_handle):
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        result_type = ctypes.c_ssize_t
+        callback_type = ctypes.WINFUNCTYPE(
+            result_type, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_size_t, ctypes.c_ssize_t
+        )
+        self.preview_wndproc_callback = callback_type(self._preview_window_proc)
+        set_proc = user32.SetWindowLongPtrW
+        set_proc.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        set_proc.restype = ctypes.c_void_p
+        self.preview_original_wndproc = set_proc(
+            ctypes.c_void_p(window_handle), -4,
+            ctypes.cast(self.preview_wndproc_callback, ctypes.c_void_p)
+        )
+
+    def _preview_window_proc(self, window_handle, message, wparam, lparam):
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        call_proc = user32.CallWindowProcW
+        call_proc.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                              ctypes.c_size_t, ctypes.c_ssize_t]
+        call_proc.restype = ctypes.c_ssize_t
+        return call_proc(
+            self.preview_original_wndproc, ctypes.c_void_p(window_handle),
+            message, wparam, lparam
+        )
+
+    def _restore_preview_key_handler(self):
+        if self.preview_window_handle and self.preview_original_wndproc:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            set_proc = user32.SetWindowLongPtrW
+            set_proc.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+            set_proc.restype = ctypes.c_void_p
+            set_proc(ctypes.c_void_p(self.preview_window_handle), -4,
+                     self.preview_original_wndproc)
+        self.preview_wndproc_callback = None
+        self.preview_original_wndproc = None
+
+    def _resize_embedded_preview(self, window_handle=None):
+        if os.name != "nt":
+            return
+        import ctypes
+
+        if window_handle is None:
+            user32 = ctypes.windll.user32
+            user32.FindWindowW.restype = ctypes.c_size_t
+            window_handle = user32.FindWindowW(None, self.preview_window_title)
+        if window_handle:
+            self.preview_surface.update_idletasks()
+            user32 = ctypes.windll.user32
+            user32.MoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_bool]
+            user32.MoveWindow(
+                ctypes.c_void_p(window_handle), 0, 0, self.preview_surface.winfo_width(),
+                self.preview_surface.winfo_height(), True
+            )
+
+    def _update_preview_clock(self):
+        if not self.preview_process or self.preview_process.poll() is not None:
+            if self.preview_process:
+                self.preview_process = None
+            self.preview_play_btn.config(text="▶ Play")
+            return
+        if os.name == "nt":
+            import ctypes
+
+            space_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x20) & 0x8000)
+            if space_down and not self.preview_space_down:
+                self.preview_space_down = True
+                self.preview_paused = not self.preview_paused
+                self.preview_started_at = time.monotonic()
+                self.preview_play_btn.config(
+                    text="▶ Resume" if self.preview_paused else "⏸ Pause"
+                )
+            elif not space_down:
+                self.preview_space_down = False
+        if self.preview_paused:
+            self.root.after(100, self._update_preview_clock)
+            return
+        self.preview_position = self.preview_position + (time.monotonic() - self.preview_started_at)
+        self.preview_started_at = time.monotonic()
+        if self.preview_duration > 0:
+            self.preview_position = min(self.preview_position, self.preview_duration)
+        self.preview_time_var.set(
+            f"{self._seconds_to_time(self.preview_position)} / {self._seconds_to_time(self.preview_duration)}"
+        )
+        if self.preview_duration > 0 and not self.preview_slider_dragging:
+            self.preview_seek_scale.set(self.preview_position / self.preview_duration * 100)
+        self.root.after(100, self._update_preview_clock)
+
+    def _preview_slider_changed(self, value):
+        if not self.preview_slider_dragging or self.preview_duration <= 0:
+            return
+        position = self.preview_duration * float(value) / 100.0
+        self.preview_time_var.set(
+            f"{self._seconds_to_time(position)} / {self._seconds_to_time(self.preview_duration)}"
+        )
+
+    def _start_preview_slider_drag(self, _event=None):
+        self.preview_slider_dragging = True
+        if self.preview_process and self.preview_process.poll() is None and not self.preview_paused:
+            self._toggle_preview_pause()
+
+    def _seek_preview_slider(self, _event=None):
+        self.preview_slider_dragging = False
+        if self.preview_duration <= 0:
+            return
+        position = self.preview_duration * self.preview_seek_scale.get() / 100.0
+        input_path = self.preview_source or self.input_path_var.get().strip()
+        if input_path and os.path.exists(input_path):
+            self._start_preview(input_path, position, None, "video")
+
+    def _on_spacebar(self, _event=None):
+        self.preview_space_down = True
+        if self.preview_process and self.preview_process.poll() is None:
+            self._toggle_preview_pause()
+        return "break"
+
+    def _set_start_to_preview(self):
+        if not self.preview_source or not self.preview_process:
+            messagebox.showinfo("Set Start", "Preview the video first, then set the start time.")
+            return
+        self.start_time_var.set(self._seconds_to_time(self.preview_position, force_subseconds=True))
+
+    def _set_end_to_preview(self):
+        if not self.preview_source or not self.preview_process:
+            messagebox.showinfo("Set End", "Preview the video first, then set the end time.")
+            return
+        self.end_time_var.set(self._seconds_to_time(self.preview_position, force_subseconds=True))
+
+    def _seek_preview(self, delta_seconds):
+        input_path = self.preview_source or self.input_path_var.get().strip()
+        if not input_path or not os.path.exists(input_path):
+            messagebox.showwarning("Preview", "Please select a valid input video.")
+            return
+        duration = self.preview_duration or self.video_duration
+        position = max(0.0, self.preview_position + delta_seconds)
+        if duration > 0:
+            position = min(position, max(0.0, duration - 0.01))
+        self._start_preview(input_path, position, None, "video")
+
+    def _toggle_preview_pause(self):
+        if self.preview_process and self.preview_process.poll() is None and self.preview_window_handle:
+            if self.preview_paused:
+                input_path = self.preview_source or self.input_path_var.get().strip()
+                if input_path and os.path.exists(input_path):
+                    self._start_preview(input_path, self.preview_position, None, "video")
+                    self.preview_space_down = True
+                return
+            if os.name == "nt":
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                user32.PostMessageW(self.preview_window_handle, 0x0100, ord("P"), 0)
+                user32.PostMessageW(self.preview_window_handle, 0x0101, ord("P"), 0)
+            self.preview_paused = not self.preview_paused
+            self.preview_started_at = time.monotonic()
+            self.preview_play_btn.config(text="▶ Resume" if self.preview_paused else "⏸ Pause")
+            return
+        input_path = self.preview_source or self.input_path_var.get().strip()
+        if input_path and os.path.exists(input_path):
+            self._start_preview(input_path, self.preview_position, None, "video")
+
+    def _stop_preview_process(self, show_placeholder=True):
+        self.preview_stop_event.set()
+        self._restore_preview_key_handler()
         if self.preview_process and self.preview_process.poll() is None:
             try:
                 self.preview_process.terminate()
             except Exception:
                 pass
         self.preview_process = None
+        self.preview_window_handle = None
+        self.preview_paused = False
+        if show_placeholder and hasattr(self, "preview_placeholder"):
+            self.preview_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
+    def stop_preview(self):
+        self._stop_preview_process(show_placeholder=True)
+        if hasattr(self, "preview_play_btn"):
+            self.preview_play_btn.config(text="▶ Play")
 
     # ------------------------------------------------------------------
     # Output Naming & Directory Placement
@@ -691,7 +1003,6 @@ class VideoClipperGUI:
                 subprocess.Popen(["xdg-open", target])
         except Exception as e:
             messagebox.showerror("Error", f"Could not open file:\n{e}")
-
     def open_output_folder(self):
         target = self._get_active_output_target()
         if not target or not os.path.exists(target):
@@ -1012,10 +1323,6 @@ class VideoClipperGUI:
         self.is_processing = processing
         state = tk.DISABLED if processing else tk.NORMAL
         self.run_btn.config(state=state)
-        self.add_queue_btn.config(state=state)
-        self.process_queue_btn.config(state=state)
-        self.remove_queue_btn.config(state=state)
-        self.clear_queue_btn.config(state=state)
         self.cancel_btn.config(state=tk.NORMAL if processing else tk.DISABLED)
 
     def log(self, message):
