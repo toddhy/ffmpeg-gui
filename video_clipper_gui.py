@@ -191,8 +191,8 @@ class VideoClipperGUI:
                               highlightbackground="#3a3a3a")
         opts_frame.grid(row=grid_row, column=0, columnspan=3, sticky="ew", pady=(4, 6), ipady=4)
 
-        # Normalization (checked by default)
-        self.normalize_var = tk.BooleanVar(value=True)
+        # Normalization (disabled by default)
+        self.normalize_var = tk.BooleanVar(value=False)
         norm_chk = tk.Checkbutton(
             opts_frame, text="Normalize volume (loudnorm)",
             variable=self.normalize_var, bg="#252525", fg="#ffffff", selectcolor="#1e1e1e",
@@ -389,7 +389,7 @@ class VideoClipperGUI:
             self.mute_var.set(True)
             self._toggle_normalize()
         else:
-            self.normalize_var.set(True)
+            self.normalize_var.set(False)
             self.mute_var.set(False)
             self._toggle_normalize()
         self.auto_generate_output_path()
