@@ -22,6 +22,7 @@ class VideoClipperGUI:
         self.preview_position = 0.0
         self.preview_source = None
         self.preview_duration = 0.0
+        self.preview_end_position = 0.0
         self.preview_started_at = 0.0
         self.preview_window_title = ""
         self.preview_window_handle = None
@@ -614,6 +615,7 @@ class VideoClipperGUI:
             messagebox.showwarning("Preview", "Please select a valid input video.")
             return
 
+        self.preview_end_position = 0.0
         self._start_preview(input_path, 0.0, None, "full video")
 
     def preview_clip(self):
@@ -636,6 +638,10 @@ class VideoClipperGUI:
         start_seconds = max(0.0, float(start_seconds))
         if self.video_duration > 0:
             start_seconds = min(start_seconds, max(0.0, self.video_duration - 0.01))
+        if duration is None and self.preview_end_position > start_seconds:
+            duration = self.preview_end_position - start_seconds
+        elif duration is not None:
+            self.preview_end_position = start_seconds + duration
         self.preview_stop_event.clear()
         self.preview_position = start_seconds
         self.preview_paused = start_paused
@@ -883,7 +889,7 @@ class VideoClipperGUI:
         if not input_path or not os.path.exists(input_path):
             messagebox.showwarning("Preview", "Please select a valid input video.")
             return
-        duration = self.preview_duration or self.video_duration
+        duration = self.preview_end_position or self.video_duration
         position = max(0.0, self.preview_position + delta_seconds)
         if duration > 0:
             position = min(position, max(0.0, duration - 0.01))
@@ -1361,7 +1367,7 @@ class VideoClipperGUI:
             vf = "fps=15,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
             cmd = [
                 ffmpeg_cmd, "-y",
-                "-ss", start_str, "-t", dur_str, "-i", input_path,
+                "-ss", start_str, "-i", input_path, "-t", dur_str,
                 "-vf", vf, "-loop", "0", output
             ]
             return self._run_command_with_progress(cmd, dur_sec, startupinfo)
@@ -1378,7 +1384,7 @@ class VideoClipperGUI:
             self.root.after(0, self.log, ">>> loudnorm pass 1/2: measuring loudness (fast-seek)...")
             p1_cmd = [
                 ffmpeg_cmd, "-y",
-                "-ss", start_str, "-t", dur_str, "-i", input_path,
+                "-ss", start_str, "-i", input_path, "-t", dur_str,
                 "-af", f"loudnorm=I={lufs}:TP=-1.5:LRA=11:print_format=json",
                 "-vn", "-f", "null", "-"
             ]
@@ -1419,7 +1425,7 @@ class VideoClipperGUI:
             return False
 
         # Main encoding command with fast-seek
-        cmd = [ffmpeg_cmd, "-y", "-ss", start_str, "-t", dur_str, "-i", input_path]
+        cmd = [ffmpeg_cmd, "-y", "-ss", start_str, "-i", input_path, "-t", dur_str]
 
         # Video encoder selection
         if item.get("hw_accel") and os.name == "nt":
