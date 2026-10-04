@@ -40,8 +40,9 @@ class VideoClipperGUI:
         self.is_processing = False
 
         self.root.title("Video Clipper Pro")
-        self.root.geometry("820x1180")
-        self.root.minsize(780, 1000)
+        available_height = max(600, root.winfo_screenheight() - 80)
+        self.root.geometry(f"820x{min(available_height, 820)}")
+        self.root.minsize(780, 600)
         self.root.configure(bg="#1e1e1e")
 
         # Discover ffmpeg, ffplay, and ffprobe
@@ -186,7 +187,7 @@ class VideoClipperGUI:
         grid_row += 1
 
         # Embedded playback surface for the full input video.
-        self.preview_surface = tk.Frame(self.main_frame, bg="#000000", width=760, height=400,
+        self.preview_surface = tk.Frame(self.main_frame, bg="#000000", width=760, height=260,
                                         highlightthickness=1, highlightbackground="#333333")
         self.preview_surface.grid(row=grid_row, column=0, columnspan=3, sticky="ew", pady=(0, 6), padx=1)
         self.preview_surface.grid_propagate(False)
@@ -382,7 +383,7 @@ class VideoClipperGUI:
         ttk.Label(self.main_frame, text="FFmpeg Console Output:").grid(row=grid_row, column=0, sticky="w", pady=(2, 0))
         grid_row += 1
 
-        self.log_area = scrolledtext.ScrolledText(self.main_frame, height=7, bg="#121212", fg="#00ff00",
+        self.log_area = scrolledtext.ScrolledText(self.main_frame, height=5, bg="#121212", fg="#00ff00",
                                                   font=("Consolas", 9), insertbackground="white")
         self.log_area.grid(row=grid_row, column=0, columnspan=3, sticky="nsew", pady=4)
         grid_row += 1
@@ -1262,6 +1263,11 @@ class VideoClipperGUI:
             messagebox.showerror("Error", "GIF clips must use a .gif output; video clips cannot use .gif.")
             return
 
+        ffmpeg_path = self.ffmpeg_path_var.get().strip().strip('"')
+        if not os.path.isfile(ffmpeg_path):
+            messagebox.showerror("FFmpeg", f"FFmpeg executable was not found:\n{ffmpeg_path}")
+            return
+
         if os.path.exists(output):
             can_overwrite = (
                 self.previous_output_path
@@ -1314,7 +1320,10 @@ class VideoClipperGUI:
             messagebox.showinfo("Success", f"Video clipped successfully!\nSaved as: {item['output']}")
         else:
             self.status_var.set("FAILED")
-            messagebox.showerror("Error", "FFmpeg failed. See console log for details.")
+            messagebox.showerror(
+                "FFmpeg failed",
+                "FFmpeg could not create the clip. The console log below contains the exact command and error."
+            )
 
     def cancel_processing(self):
         self.cancel_requested = True
@@ -1344,7 +1353,7 @@ class VideoClipperGUI:
     # ------------------------------------------------------------------
 
     def _execute_clip_process(self, item):
-        ffmpeg_cmd = self.ffmpeg_path_var.get()
+        ffmpeg_cmd = self.ffmpeg_path_var.get().strip().strip('"')
         input_path = item["input_path"]
         start_sec = self._time_to_seconds(item["start"])
         end_sec = self._time_to_seconds(item["end"])
@@ -1362,6 +1371,18 @@ class VideoClipperGUI:
         self.root.after(0, self.log, f"\n{'='*50}\n>>> Clipping: {os.path.basename(input_path)}")
         self.root.after(0, self.log, f">>> Segment: {start_str} (Duration: {dur_str}s)")
 
+        if not os.path.isfile(ffmpeg_cmd):
+            self.root.after(0, self.log, f"ERROR: FFmpeg executable not found: {ffmpeg_cmd}")
+            return False
+
+        output_dir = os.path.dirname(os.path.abspath(output))
+        if not os.path.isdir(output_dir):
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except OSError as exc:
+                self.root.after(0, self.log, f"ERROR: Cannot create output directory '{output_dir}': {exc}")
+                return False
+
         # Case 1: GIF Export
         if item.get("format") == "GIF":
             vf = "fps=15,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
@@ -1370,6 +1391,7 @@ class VideoClipperGUI:
                 "-ss", start_str, "-i", input_path, "-t", dur_str,
                 "-vf", vf, "-loop", "0", output
             ]
+            self.root.after(0, self.log, f">>> Command: {subprocess.list2cmdline(cmd)}")
             return self._run_command_with_progress(cmd, dur_sec, startupinfo)
 
         # Case 2: MP4 Video Export
@@ -1427,6 +1449,9 @@ class VideoClipperGUI:
         # Main encoding command with fast-seek
         cmd = [ffmpeg_cmd, "-y", "-ss", start_str, "-i", input_path, "-t", dur_str]
 
+        # H.264 requires even dimensions; some older videos use an odd height.
+        cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+
         # Video encoder selection
         if item.get("hw_accel") and os.name == "nt":
             self.root.after(0, self.log, ">>> Using Windows Media Foundation GPU encoder (h264_mf)...")
@@ -1443,6 +1468,7 @@ class VideoClipperGUI:
                 cmd += ["-af", af_filter]
 
         cmd.append(output)
+        self.root.after(0, self.log, f">>> Command: {subprocess.list2cmdline(cmd)}")
         return self._run_command_with_progress(cmd, dur_sec, startupinfo)
 
     def _run_command_with_progress(self, cmd, total_dur_sec, startupinfo):
@@ -1475,10 +1501,14 @@ class VideoClipperGUI:
             self.current_process = None
             if self.cancel_requested:
                 return False
-            return process.returncode == 0
+            if process.returncode != 0:
+                self.root.after(0, self.log, f"ERROR: FFmpeg exited with code {process.returncode}")
+                return False
+            return True
         except Exception as e:
             self.current_process = None
-            self.root.after(0, lambda: self.log(f"EXCEPTION: {str(e)}"))
+            error_message = str(e)
+            self.root.after(0, self.log, f"EXCEPTION: {error_message}")
             return False
 
     def on_closing(self):
